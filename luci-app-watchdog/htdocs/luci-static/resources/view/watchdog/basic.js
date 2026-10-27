@@ -143,11 +143,20 @@ return view.extend({
         
         o.cfgvalue = function(section_id) {
             return fs.read('/usr/share/watchdog/api/ip_blacklist')
-                .then(function(content) {
-                    return content || '';
+                .then(function(res) {
+                    // 兼容不同 luci-base：fs.read 可能直接返回字符串，也可能返回 { stdout/data } 结构
+                    if (res == null) return '';
+                    if (typeof res === 'string') return res;
+                    return res.stdout || res.data || '';
                 })
                 .catch(function(err) {
                     console.error('Failed to read blacklist:', err);
+                    // 原来静默返回 ''，界面上看不到原因；改为弹窗提示，便于定位 rpcd 权限问题
+                    ui.addNotification(null, E('p', [
+                        _('Failed to read blacklist file via rpcd: %s').format(
+                            (err && err.message) ? err.message : JSON.stringify(err)
+                        ) + ' ' + _('Check /usr/share/rpcd/acl.d/luci-app-watchdog.json')
+                    ]), 'warning');
                     return '';
                 });
         };

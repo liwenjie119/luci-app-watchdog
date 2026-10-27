@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # Copyright (C) 2025 sirpdboy herboy2008@gmail.com https://github.com/sirpdboy/luci-app-watchdog
-# 
+#
+# 补丁说明：SSH 登录事件监听适配 openssh-server（原仅适配 dropbear）
 
 APP=watchdog
 base_dir="/usr/share/$APP"
@@ -404,6 +405,26 @@ set_ip_black() {
 	done <<<"$combined_fw_info_blacklist"
 }
 
+# ============================================================
+# 【新增】从日志行提取登录 IP，兼容 dropbear / openssh
+#   dropbear:  ... Password auth succeeded for 'root' from 1.2.3.4:54321
+#   openssh:   ... Accepted password for root from 1.2.3.4 port 54321 ssh2
+# 关键：不再用 awk '{print $NF}'（openssh 行尾是 ssh2，不是 IP），
+#       而是定位关键字 "from" 后的第一个字段，再按各自格式剥离端口
+# ============================================================
+extract_login_ip() {
+	local line="$1" ip
+	ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="from"){print $(i+1); exit}}')
+	[ -z "$ip" ] && ip=$(echo "$line" | awk '{print $NF}')
+	[ -z "$ip" ] && return
+	ip="${ip%%%*}"                                   # 去掉 IPv6 zone 标识（%eth0 等）
+	case "$ip" in
+		*\]:[0-9]*)        ip="${ip%:*}" ;;          # dropbear IPv6: [2001:db8::1]:54321
+		*.*.*.*:[0-9]*)    ip="${ip%:*}" ;;          # IPv4: 1.2.3.4:54321
+	esac
+	echo "$ip"
+}
+
 # 监听登录事件
 run_logins() {
 	if [ -n "$web_logged" ] || [ -n "$ssh_logged" ] || [ -n "$web_login_failed" ] || [ -n "$ssh_login_failed" ]; then
@@ -415,8 +436,11 @@ run_logins() {
 				}
 
 				[ -n "$ssh_logged" ] && {
-					ssh_login_ip=$(echo "$line" | grep -i "Password auth succeeded\|Pubkey auth succeeded" | awk '{print $NF}' | sed -nr 's#^(.*):.[0-9]{1,5}#\1#gp' | sed -e 's/%.*//')
-					[ -n "$ssh_login_ip" ] && process_login "$ssh_login_ip" $(echo "$line" | awk '{print $4}') ssh_login_counts
+					# 成功登录：dropbear = Password/Pubkey auth succeeded ；openssh = Accepted password/publickey for
+					echo "$line" | grep -qiE "Password auth succeeded|Pubkey auth succeeded|Accepted password for|Accepted publickey for" && {
+						ssh_login_ip=$(extract_login_ip "$line")
+						[ -n "$ssh_login_ip" ] && process_login "$ssh_login_ip" $(echo "$line" | awk '{print $4}') ssh_login_counts
+					}
 				}
 
 				[ -n "$web_login_failed" ] && {
@@ -425,13 +449,20 @@ run_logins() {
 				}
 
 				[ -n "$ssh_login_failed" ] && {
-					# 匹配特定的 SSH 登录失败情况并提取 IP 地址和时间
-					ssh_failed_ip=$(echo "$line" | grep -iE "Bad password attempt|Login attempt for nonexistent user|Max auth tries reached" | awk '{print $NF}' | sed -nr 's#^(.*):[0-9]{1,5}#\1#gp' | sed -e 's/%.*//')
+					ssh_failed_ip=""
+					# 失败登录：dropbear = Bad password attempt / Login attempt for nonexistent user / Max auth tries reached
+					#           openssh  = Failed password for / Failed none for
+					if echo "$line" | grep -qiE "Bad password attempt|Login attempt for nonexistent user|Max auth tries reached|Failed password for|Failed none for"; then
+						ssh_failed_ip=$(extract_login_ip "$line")
+					fi
 
-					# 如果未能提取到 IP，从日志标识符提取失败用户的 ID，并再次提取 IP
+					# 兜底（保持原 dropbear 逻辑不变）：部分版本日志不带 IP，按进程号回查 "Child connection from"
 					if [ -z "$ssh_failed_ip" ]; then
-						ssh_failed_num=$(echo "$line" | sed -n 's/.*authpriv\.warn dropbear\[\([0-9]\+\)\]: Login attempt for nonexistent user/\1/p')
-						[ -n "$ssh_failed_num" ] && ssh_failed_ip=$(logread notice | grep "authpriv\.info dropbear\[${ssh_failed_num}\].*Child connection from" | awk '{print $NF}' | sed -nr 's#^(.*):[0-9]{1,5}#\1#gp' | sed -e 's/%.*//' | tail -n 1)
+						ssh_failed_num=$(echo "$line" | sed -nE 's/.*authpriv\.warn dropbear\[([0-9]+)\]: Login attempt for nonexistent user.*/\1/p')
+						if [ -n "$ssh_failed_num" ]; then
+							ssh_failed_line=$(logread notice 2>/dev/null | grep -E "authpriv\.info dropbear\[${ssh_failed_num}\].*Child connection from" | tail -n 1)
+							[ -n "$ssh_failed_line" ] && ssh_failed_ip=$(extract_login_ip "$ssh_failed_line")
+						fi
 					fi
 
 					# 如果成功提取到 IP 地址，调用 process_login 处理
@@ -512,8 +543,11 @@ login_send() {
 		local login_mode=$(logread notice | grep -E ".* $login_time.*$login_ip.*" | awk '{print $13}' | tail -n 1)
 		[ "$login_mode" = "/" ] && login_mode="$(translate "/ (Homepage login)")"
 	elif [[ "$log_type" == "ssh_login"* ]]; then
-		# SSH 登录
-		local login_mode=$(logread notice | grep -E ".* $login_time.*$login_ip.*" | awk '{print $8}' | tail -n 1)
+		# SSH 成功登录：openssh 日志原文 "Accepted password/publickey for ..."，提取认证方式；
+		#               dropbear 行保持原来 awk '{print $8}' 的取法不变
+		local login_raw=$(logread notice 2>/dev/null | grep -E ".* $login_time.*$login_ip.*" | tail -n 1)
+		local login_mode=$(echo "$login_raw" | sed -nE 's/.*Accepted (password|publickey|keyboard-interactive) for.*/\1/p')
+		[ -z "$login_mode" ] && login_mode=$(echo "$login_raw" | awk '{print $8}')
 	else
 		local login_mode=$(logread notice | grep -E ".* $login_time.*$login_ip.*" | awk '{for(i=8;i<NF;i++) if($i=="from") break; else printf $i " "}' | tail -n 1)
 	fi
